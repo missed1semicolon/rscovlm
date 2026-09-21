@@ -1,8 +1,10 @@
+
 import os
 import io
 import re
 import base64
 import traceback
+import math
 
 import torch
 import runpod
@@ -110,7 +112,9 @@ def collect_images(job_input):
     image_b64 = job_input.get("image_b64")
 
     if image_b64:
-        images.append(decode_base64_image(image_b64))
+        images.append(
+            decode_base64_image(image_b64)
+        )
         labels.append("Primary image")
 
     images_b64 = job_input.get("images_b64")
@@ -126,7 +130,9 @@ def collect_images(job_input):
                 images.append(
                     decode_base64_image(image_data)
                 )
-                labels.append(f"Image {index + 1}")
+                labels.append(
+                    f"Image {index + 1}"
+                )
 
     # Compatibility with the existing agent.py payload.
     additional_images = job_input.get(
@@ -153,11 +159,15 @@ def collect_images(job_input):
     image_t2 = job_input.get("image_t2_b64")
 
     if image_t1:
-        images.append(decode_base64_image(image_t1))
+        images.append(
+            decode_base64_image(image_t1)
+        )
         labels.append("Time 1 image")
 
     if image_t2:
-        images.append(decode_base64_image(image_t2))
+        images.append(
+            decode_base64_image(image_t2)
+        )
         labels.append("Time 2 image")
 
     if not images:
@@ -336,7 +346,9 @@ def build_prompt(
             content = item.get("content", "")
 
             if content:
-                lines.append(f"{role}: {content}")
+                lines.append(
+                    f"{role}: {content}"
+                )
 
         if lines:
             history_text = (
@@ -359,48 +371,77 @@ def build_prompt(
 # PARSE PIXEL BOXES
 # ============================================================
 
-def parse_groundings(response_text, image_width, image_height):
+def parse_groundings(
+    response_text,
+    image_width,
+    image_height
+):
     """
-    Parses lines such as:
-        1241,430,1295,476 - visible building
+    Parses RSCoVLM outputs such as:
 
-    Returns normalized boxes in the frontend's expected order:
+        1245,430,1297,481 visible buildings
+        1245,430,1297,481 - visible buildings
+        (1245,430,1297,481) - visible buildings
+
+    Assumes raw coordinates are x1,y1,x2,y2 pixels.
+
+    Returns normalized boxes in frontend order:
         [ymin, xmin, ymax, xmax]
-
-    This parser assumes x1,y1,x2,y2 pixel coordinates.
     """
 
     groundings = []
 
+    if not response_text:
+        return groundings
+
+    if image_width <= 0 or image_height <= 0:
+        return groundings
+
     pattern = re.compile(
         r"""
+        ^\s*
         \(?\s*
-        (\d+(?:\.\d+)?)\s*[,;]\s*
-        (\d+(?:\.\d+)?)\s*[,;]\s*
-        (\d+(?:\.\d+)?)\s*[,;]\s*
-        (\d+(?:\.\d+)?)\s*
-        \)?\s*
-        (?:[-:|]\s*(.+))?
+        (-?\d+(?:\.\d+)?)\s*[,;]\s*
+        (-?\d+(?:\.\d+)?)\s*[,;]\s*
+        (-?\d+(?:\.\d+)?)\s*[,;]\s*
+        (-?\d+(?:\.\d+)?)\s*
+        \)?
+        \s*
+        (?:[-:|]\s*)?
+        (.*?)
+        \s*$
         """,
         re.VERBOSE
     )
 
     for line in response_text.splitlines():
-        match = pattern.fullmatch(line.strip())
+        match = pattern.fullmatch(line)
 
         if not match:
             continue
 
-        x1, y1, x2, y2 = [
-            float(match.group(i))
-            for i in range(1, 5)
-        ]
+        try:
+            x1, y1, x2, y2 = [
+                float(match.group(i))
+                for i in range(1, 5)
+            ]
+        except (TypeError, ValueError):
+            continue
+
+        if not all(
+            math.isfinite(value)
+            for value in (x1, y1, x2, y2)
+        ):
+            continue
 
         label = (
             match.group(5) or "Detected object"
         ).strip()
 
-        # Reject impossible or non-pixel coordinates.
+        if not label:
+            label = "Detected object"
+
+        # Reject impossible or out-of-image coordinates.
         if (
             x1 < 0 or y1 < 0
             or x2 < 0 or y2 < 0
@@ -419,7 +460,8 @@ def parse_groundings(response_text, image_width, image_height):
         if right <= left or bottom <= top:
             continue
 
-        # Frontend expects normalized [ymin,xmin,ymax,xmax].
+        # Normalize for ImageBinder:
+        # [ymin, xmin, ymax, xmax]
         bbox = [
             top / image_height,
             left / image_width,
@@ -501,7 +543,11 @@ def run_inference(images, prompt):
         clean_up_tokenization_spaces=False,
     )
 
-    return output_text[0].strip() if output_text else ""
+    return (
+        output_text[0].strip()
+        if output_text
+        else ""
+    )
 
 
 # ============================================================
@@ -518,6 +564,7 @@ def handler(job):
         )
 
         metadata = job_input.get("metadata", {})
+
         conversation_history = job_input.get(
             "conversation_history",
             []
@@ -525,7 +572,9 @@ def handler(job):
 
         task_type = detect_task_type(job_input)
 
-        images, image_labels = collect_images(job_input)
+        images, image_labels = collect_images(
+            job_input
+        )
 
         first_image = images[0]
 
@@ -550,16 +599,16 @@ def handler(job):
                 "an empty response."
             )
 
-        groundings = []
+        # Always attempt to parse coordinate-form output.
+        # This handles cases where task_type was classified
+        # as VQA even though the model returned a box.
+        groundings = parse_groundings(
+            response_text,
+            first_image.width,
+            first_image.height,
+        )
 
-        if task_type == "grounding":
-            groundings = parse_groundings(
-                response_text,
-                first_image.width,
-                first_image.height,
-            )
-
-        return {
+        result = {
             "response_text": response_text,
             "groundings": groundings,
             "task_type": task_type,
@@ -577,6 +626,17 @@ def handler(job):
                 "device": DEVICE,
             },
         }
+
+        print(
+            "SNZ inference complete:",
+            {
+                "task_type": task_type,
+                "groundings_count": len(groundings),
+                "image_count": len(images),
+            }
+        )
+
+        return result
 
     except Exception as exc:
         traceback.print_exc()
