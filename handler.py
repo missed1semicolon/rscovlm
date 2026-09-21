@@ -397,6 +397,8 @@ def parse_groundings(
     if image_width <= 0 or image_height <= 0:
         return groundings
 
+    # Match the first four comma/semicolon-separated values.
+    # The label may follow directly or after punctuation.
     pattern = re.compile(
         r"""
         ^\s*
@@ -404,10 +406,9 @@ def parse_groundings(
         (-?\d+(?:\.\d+)?)\s*[,;]\s*
         (-?\d+(?:\.\d+)?)\s*[,;]\s*
         (-?\d+(?:\.\d+)?)\s*[,;]\s*
-        (-?\d+(?:\.\d+)?)\s*
-        \)?
-        \s*
-        (?:[-:|]\s*)?
+        (-?\d+(?:\.\d+)?)
+        \s*\)?
+        (?:\s*[-:|]\s*|\s+)
         (.*?)
         \s*$
         """,
@@ -415,7 +416,12 @@ def parse_groundings(
     )
 
     for line in response_text.splitlines():
-        match = pattern.fullmatch(line)
+        line = line.strip()
+
+        if not line:
+            continue
+
+        match = pattern.match(line)
 
         if not match:
             continue
@@ -437,9 +443,6 @@ def parse_groundings(
         label = (
             match.group(5) or "Detected object"
         ).strip()
-
-        if not label:
-            label = "Detected object"
 
         # Reject impossible or out-of-image coordinates.
         if (
@@ -471,7 +474,7 @@ def parse_groundings(
 
         groundings.append({
             "bbox": bbox,
-            "label": label,
+            "label": label or "Detected object",
             "coordinate_type": "normalized_image_pixels",
         })
 
@@ -599,16 +602,35 @@ def handler(job):
                 "an empty response."
             )
 
-        # Always attempt to parse coordinate-form output.
-        # This handles cases where task_type was classified
-        # as VQA even though the model returned a box.
+        # Always parse coordinate-form output, even if the
+        # task was classified as VQA or caption.
         groundings = parse_groundings(
             response_text,
             first_image.width,
             first_image.height,
         )
 
-        result = {
+        # Diagnostic logs for RunPod.
+        print(
+            "RAW MODEL RESPONSE:",
+            repr(response_text)
+        )
+
+        print(
+            "PARSED GROUNDINGS:",
+            groundings
+        )
+
+        print(
+            "SNZ inference complete:",
+            {
+                "task_type": task_type,
+                "groundings_count": len(groundings),
+                "image_count": len(images),
+            }
+        )
+
+        return {
             "response_text": response_text,
             "groundings": groundings,
             "task_type": task_type,
@@ -626,17 +648,6 @@ def handler(job):
                 "device": DEVICE,
             },
         }
-
-        print(
-            "SNZ inference complete:",
-            {
-                "task_type": task_type,
-                "groundings_count": len(groundings),
-                "image_count": len(images),
-            }
-        )
-
-        return result
 
     except Exception as exc:
         traceback.print_exc()
