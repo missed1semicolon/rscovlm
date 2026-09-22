@@ -636,6 +636,86 @@ def parse_grounding_lines(response_text: str) -> List[Dict[str, Any]]:
     return candidates
 
 
+def convert_grounding_to_original(
+    values: List[float],
+    model_width: int,
+    model_height: int,
+    original_width: int,
+    original_height: int,
+) -> Tuple[List[float], str]:
+    """
+    Convert an RSCoVLM/Qwen grounding box from the model-view pixel
+    coordinate system into the normalized frontend coordinate system.
+
+    Model output convention:
+        [x1, y1, x2, y2]
+
+    Frontend convention:
+        [ymin, xmin, ymax, xmax]
+
+    The model-view dimensions come from Qwen's image_grid_thw after the
+    processor has resized the image. The original dimensions are the
+    dimensions of the uploaded PIL image.
+    """
+    if len(values) != 4:
+        raise ValueError(
+            f"Expected four grounding coordinates, got: {values}"
+        )
+
+    if model_width <= 0 or model_height <= 0:
+        raise ValueError(
+            f"Invalid model-view size: {model_width}x{model_height}"
+        )
+
+    if original_width <= 0 or original_height <= 0:
+        raise ValueError(
+            f"Invalid original image size: "
+            f"{original_width}x{original_height}"
+        )
+
+    x1, y1, x2, y2 = [float(value) for value in values]
+
+    if not all(torch.isfinite(torch.tensor(value)).item() for value in (x1, y1, x2, y2)):
+        raise ValueError(
+            f"Non-finite grounding coordinates: {values}"
+        )
+
+    # Normalize coordinate ordering first. Models occasionally emit the
+    # opposite corners in reverse order.
+    left = min(x1, x2)
+    right = max(x1, x2)
+    top = min(y1, y2)
+    bottom = max(y1, y2)
+
+    # Coordinates are pixels in the image actually presented to the model.
+    # Clamp them before scaling so a slightly over-running model prediction
+    # cannot produce invalid frontend coordinates.
+    left = clamp(left, 0.0, float(model_width))
+    right = clamp(right, 0.0, float(model_width))
+    top = clamp(top, 0.0, float(model_height))
+    bottom = clamp(bottom, 0.0, float(model_height))
+
+    if right <= left or bottom <= top:
+        raise ValueError(
+            f"Degenerate grounding box after clamping: "
+            f"[{left}, {top}, {right}, {bottom}]"
+        )
+
+    # Map model-view pixels back to the original image pixels.
+    original_left = left / float(model_width) * float(original_width)
+    original_right = right / float(model_width) * float(original_width)
+    original_top = top / float(model_height) * float(original_height)
+    original_bottom = bottom / float(model_height) * float(original_height)
+
+    # ImageBinder expects normalized [ymin, xmin, ymax, xmax].
+    ymin = clamp(original_top / float(original_height), 0.0, 1.0)
+    xmin = clamp(original_left / float(original_width), 0.0, 1.0)
+    ymax = clamp(original_bottom / float(original_height), 0.0, 1.0)
+    xmax = clamp(original_right / float(original_width), 0.0, 1.0)
+
+    return [ymin, xmin, ymax, xmax], "model_view_pixels"
+
+
 def parse_groundings(
     response_text: str,
     model_width: int,
