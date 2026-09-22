@@ -1,28 +1,31 @@
 import os
 import io
 import re
+import json
 import base64
 import traceback
-import math
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import runpod
 
 from PIL import Image
+
 from transformers import (
     AutoProcessor,
     Qwen2_5_VLForConditionalGeneration,
 )
+
 from qwen_vl_utils import process_vision_info
 
 
 # ============================================================
-# CONFIGURATION
+# Configuration
 # ============================================================
 
 MODEL_ID = os.getenv(
     "MODEL_ID",
-    "Qingyun/RSCoVLM-7B-2512"
+    "Qingyun/RSCoVLM-7B-2512",
 )
 
 MAX_NEW_TOKENS = int(
@@ -37,35 +40,89 @@ MAX_PIXELS = int(
     os.getenv("MAX_PIXELS", str(1280 * 28 * 28))
 )
 
+# Qwen2.5-VL uses a 14-pixel patch with a spatial merge factor of 2,
+# so one visual grid step corresponds to 28 image pixels.
+VISION_GRID_SIZE = int(
+    os.getenv("VISION_GRID_SIZE", "28")
+)
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+GROUNDING_TASK_NAMES = {
+    "grounding",
+    "detection",
+    "bbox",
+    "bounding_box",
+}
+
+GROUNDING_KEYWORDS = (
+    "bounding box",
+    "bounding boxes",
+    "bbox",
+    "locate",
+    "localize",
+    "localise",
+    "where is",
+    "where are",
+    "find the",
+    "find all",
+    "detect",
+    "highlight",
+    "show me where",
+)
+
+
+# ============================================================
+# Global model objects
+# ============================================================
 
 model = None
 processor = None
 
 
 # ============================================================
-# MODEL LOADING
+# Model loading
 # ============================================================
 
 def load_model():
-    global model, processor
+    global model
+    global processor
 
-    print("=" * 60)
+    print("=" * 70)
     print("SNZ RSCoVLM WORKER STARTING")
-    print("Model:", MODEL_ID)
-    print("Device:", DEVICE)
-    print("=" * 60)
+    print("=" * 70)
+    print(f"Model: {MODEL_ID}")
+    print(f"Device: {DEVICE}")
+    print(f"PyTorch: {torch.__version__}")
+    print(f"PyTorch CUDA: {torch.version.cuda}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
 
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "CUDA GPU is required for RSCoVLM."
+            "CUDA GPU is required for the RSCoVLM worker."
         )
+
+    print(f"GPU count: {torch.cuda.device_count()}")
+
+    for index in range(torch.cuda.device_count()):
+        print(
+            f"GPU {index}: "
+            f"{torch.cuda.get_device_name(index)}"
+        )
+
+    print("-" * 70)
+    print("Loading processor...")
 
     processor = AutoProcessor.from_pretrained(
         MODEL_ID,
         min_pixels=MIN_PIXELS,
         max_pixels=MAX_PIXELS,
     )
+
+    print("Processor loaded successfully.")
+
+    print("-" * 70)
+    print("Loading RSCoVLM model...")
 
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         MODEL_ID,
@@ -78,536 +135,344 @@ def load_model():
 
     print("RSCoVLM loaded successfully.")
 
+    print(
+        "GPU memory allocated: "
+        f"{torch.cuda.memory_allocated() / 1024**3:.2f} GB"
+    )
+
+    print(
+        "GPU memory reserved: "
+        f"{torch.cuda.memory_reserved() / 1024**3:.2f} GB"
+    )
+
+    print("=" * 70)
+
 
 # ============================================================
-# BASE64 IMAGE DECODING
+# Base64 image decoding
 # ============================================================
 
-def decode_base64_image(image_b64):
+def decode_base64_image(image_b64: str) -> Image.Image:
     if not image_b64:
         raise ValueError("Image Base64 data is empty.")
 
     if image_b64.startswith("data:image"):
         image_b64 = image_b64.split(",", 1)[1]
 
-    image_bytes = base64.b64decode(
-        image_b64,
-        validate=True
-    )
-
-    return Image.open(
-        io.BytesIO(image_bytes)
-    ).convert("RGB")
-
-
-# ============================================================
-# MODEL-VIEW RESIZING
-# ============================================================
-
-# RSCoVLM uses scalable bounding boxes whose coordinate resolution
-# follows the image resolution presented to the model. Keep the
-# grounding coordinate system explicit by giving the model a bounded
-# model-view image and then mapping its box back to the original image.
-GROUNDING_MAX_SIDE = int(os.getenv("GROUNDING_MAX_SIDE", "1008"))
-MIN_GROUNDING_SIDE = int(os.getenv("MIN_GROUNDING_SIDE", "224"))
-
-
-def resize_for_grounding(image):
-    original_width, original_height = image.size
-
-    if original_width <= 0 or original_height <= 0:
-        raise ValueError("Image has invalid dimensions.")
-
-    longest_side = max(original_width, original_height)
-
-    scale = min(
-        1.0,
-        GROUNDING_MAX_SIDE / longest_side,
-    )
-
-    if longest_side < MIN_GROUNDING_SIDE:
-        scale = min(
-            GROUNDING_MAX_SIDE / longest_side,
-            MIN_GROUNDING_SIDE / longest_side,
+    try:
+        image_bytes = base64.b64decode(
+            image_b64,
+            validate=True,
         )
+    except Exception as exc:
+        raise ValueError(
+            f"Invalid Base64 image data: {exc}"
+        ) from exc
 
-    model_width = max(1, round(original_width * scale))
-    model_height = max(1, round(original_height * scale))
+    try:
+        image = Image.open(
+            io.BytesIO(image_bytes)
+        ).convert("RGB")
+    except Exception as exc:
+        raise ValueError(
+            f"Unable to decode image: {exc}"
+        ) from exc
 
-    if (model_width, model_height) == image.size:
-        return image.copy()
+    return image
 
-    return image.resize(
-        (model_width, model_height),
-        Image.Resampling.LANCZOS,
+
+# ============================================================
+# Image collection
+# ============================================================
+
+def collect_images(job_input: dict):
+    images: List[Image.Image] = []
+    image_labels: List[str] = []
+
+    image_b64 = job_input.get("image_b64")
+
+    if image_b64:
+        images.append(decode_base64_image(image_b64))
+        image_labels.append("Primary image")
+
+    images_b64 = job_input.get("images_b64")
+
+    if images_b64:
+        if not isinstance(images_b64, list):
+            raise ValueError(
+                "'images_b64' must be a list of Base64 images."
+            )
+
+        for index, image_data in enumerate(images_b64):
+            if not image_data:
+                continue
+
+            images.append(decode_base64_image(image_data))
+            image_labels.append(f"Image {index + 1}")
+
+    # The API's multi-image route uses this field.
+    additional_images_b64 = job_input.get(
+        "additional_images_b64"
     )
 
+    if additional_images_b64:
+        if not isinstance(additional_images_b64, list):
+            raise ValueError(
+                "'additional_images_b64' must be a list."
+            )
 
-def prepare_model_images(images, task_type):
-    if task_type != "grounding":
-        return images
+        for index, image_data in enumerate(
+            additional_images_b64
+        ):
+            if not image_data:
+                continue
 
-    return [
-        resize_for_grounding(image)
-        for image in images
-    ]
+            images.append(decode_base64_image(image_data))
+            image_labels.append(
+                f"Additional image {index + 1}"
+            )
 
+    image_t1_b64 = job_input.get("image_t1_b64")
+    image_t2_b64 = job_input.get("image_t2_b64")
 
-# ============================================================
-# COLLECT IMAGES
-# ============================================================
+    if image_t1_b64:
+        images.append(decode_base64_image(image_t1_b64))
+        image_labels.append("Time 1 image")
 
-def collect_images(job_input):
-    images = []
-    labels = []
+    if image_t2_b64:
+        images.append(decode_base64_image(image_t2_b64))
+        image_labels.append("Time 2 image")
 
-    # Prefer explicit temporal pair fields when present.
-    image_t1 = job_input.get("image_t1_b64")
-    image_t2 = job_input.get("image_t2_b64")
-
-    if image_t1:
-        images.append(decode_base64_image(image_t1))
-        labels.append("Before image (Time 1)")
-
-    if image_t2:
-        images.append(decode_base64_image(image_t2))
-        labels.append("After image (Time 2)")
-
-    # ChangeFormer's mask is the third image.
+    # ChangeFormer's predicted mask is deliberately included only when
+    # present. It is an image in the RSCoVLM prompt, not a grounding target.
     mask_b64 = job_input.get("mask_b64")
 
     if mask_b64:
-        mask = decode_base64_image(mask_b64).convert("RGB")
-        images.append(mask)
-        labels.append(
-            "ChangeFormer binary change mask "
-            "(white=detected change, black=unchanged)"
-        )
-
-    # Existing compatibility fields, used only when no
-    # explicit temporal pair was supplied.
-    if not image_t1 and not image_t2:
-        image_b64 = job_input.get("image_b64")
-
-        if image_b64:
-            images.append(decode_base64_image(image_b64))
-            labels.append("Primary image")
-
-        images_b64 = job_input.get("images_b64")
-
-        if images_b64:
-            if not isinstance(images_b64, list):
-                raise ValueError(
-                    "'images_b64' must be a list."
-                )
-
-            for index, image_data in enumerate(images_b64):
-                if image_data:
-                    images.append(
-                        decode_base64_image(image_data)
-                    )
-                    labels.append(f"Image {index + 1}")
-
-        additional_images = job_input.get(
-            "additional_images_b64"
-        )
-
-        if additional_images:
-            if not isinstance(additional_images, list):
-                raise ValueError(
-                    "'additional_images_b64' must be a list."
-                )
-
-            for index, image_data in enumerate(additional_images):
-                if image_data:
-                    images.append(
-                        decode_base64_image(image_data)
-                    )
-                    labels.append(
-                        f"Additional image {index + 1}"
-                    )
+        images.append(decode_base64_image(mask_b64))
+        image_labels.append("Change-detection mask")
 
     if not images:
         raise ValueError(
-            "No image supplied to RSCoVLM."
+            "No image was supplied. Provide image_b64, images_b64, "
+            "additional_images_b64, image_t1_b64/image_t2_b64, "
+            "or mask_b64."
         )
 
-    return images, labels
+    return images, image_labels
 
 
 # ============================================================
-# TASK TYPE
+# Task helpers
 # ============================================================
 
-def detect_task_type(job_input):
-    task_type = (
-        job_input.get("task_type", "")
-        .strip()
-        .lower()
+def is_grounding_task(
+    task_type: Optional[str],
+    prompt: str,
+) -> bool:
+    task = (task_type or "").strip().lower()
+    query = (prompt or "").strip().lower()
+
+    if task in GROUNDING_TASK_NAMES:
+        return True
+
+    return any(
+        keyword in query
+        for keyword in GROUNDING_KEYWORDS
     )
-
-    if task_type in ("caption", "grounding", "vqa"):
-        return task_type
-
-    task_name = (
-        job_input.get("task_name", "")
-        .strip()
-        .lower()
-    )
-
-    prompt = (
-        job_input.get("prompt", "")
-        .strip()
-        .lower()
-    )
-
-    text = f"{task_name} {prompt}"
-
-    caption_terms = (
-        "caption",
-        "describe the scene",
-        "scene description",
-        "describe this image",
-        "summarize the image",
-    )
-
-    grounding_terms = (
-        "grounding",
-        "bounding box",
-        "bounding boxes",
-        "bbox",
-        "locate",
-        "mark the",
-        "highlight the",
-        "detect objects",
-        "object detection",
-    )
-
-    if any(term in text for term in caption_terms):
-        return "caption"
-
-    if any(term in text for term in grounding_terms):
-        return "grounding"
-
-    return "vqa"
 
 
 # ============================================================
-# TASK INSTRUCTIONS
-# ============================================================
-
-def task_instruction(task_type, image):
-    width, height = image.size
-
-    if task_type == "caption":
-        return f"""
-TASK: IMAGE CAPTIONING
-
-Image dimensions: width={width}, height={height} pixels.
-
-Write a concise caption describing visible remote-sensing features.
-Do not invent geographic locations or unsupported details.
-""".strip()
-
-    if task_type == "grounding":
-        return f"""
-TASK: VISUAL GROUNDING
-
-The image presented to you is exactly {width} pixels wide by {height} pixels high.
-
-Identify the object requested by the user.
-
-Return exactly one line when the object is found:
-x1,y1,x2,y2 - object label
-
-Coordinate convention:
-- x increases left to right.
-- y increases top to bottom.
-- (x1,y1) is the top-left corner.
-- (x2,y2) is the bottom-right corner.
-- Coordinates are PIXELS IN THE IMAGE YOU ARE CURRENTLY SEEING.
-- x must be between 0 and {width}; y must be between 0 and {height}.
-- Do not use coordinates from the original upload if the image has been resized.
-- Do not use normalized 0-1 or 0-1000 coordinates.
-- Do not invent a box if the object cannot be located.
-""".strip()
-
-    return """
-TASK: REMOTE-SENSING VISUAL QUESTION ANSWERING
-
-Answer using visible image evidence.
-Distinguish observations from uncertainty.
-Do not invent geographic facts.
-""".strip()
-
-
-# ============================================================
-# PROMPT CONSTRUCTION
+# Prompt construction
 # ============================================================
 
 def build_prompt(
-    prompt,
-    task_type,
-    image,
+    prompt: str,
+    image_count: int,
     image_labels=None,
     conversation_history=None,
     metadata=None,
-    has_mask=False,
+    task_type: Optional[str] = None,
 ):
     prompt = (prompt or "").strip()
 
     if not prompt:
-        prompt = "Analyze the supplied remote-sensing images."
+        prompt = "Analyze the supplied remote sensing image."
 
-    instruction = task_instruction(
+    grounding = is_grounding_task(
         task_type,
-        image
+        prompt,
     )
+
+    if image_count == 1:
+        image_instruction = """
+You are analyzing one remote-sensing image.
+
+Base your answer on the visible evidence in that image.
+""".strip()
+    else:
+        image_instruction = f"""
+You are analyzing {image_count} remote-sensing images.
+
+Treat the supplied images as separate but related observations.
+
+Compare them when the user's question requires comparison.
+
+Do not assume that multiple images represent the same location or
+same time unless the supplied metadata or user question indicates this.
+
+When comparing images, explicitly distinguish:
+- observations common to the images
+- differences between the images
+- uncertain interpretations
+""".strip()
+
+    grounding_instruction = ""
+
+    if grounding:
+        grounding_instruction = """
+
+GROUNDING MODE
+
+The user is asking you to locate an object or region in the image.
+You MUST return a machine-readable bounding box for every object you
+identify for the user's requested location.
+
+Use this exact coordinate convention:
+
+    x1, y1, x2, y2 - object label
+
+where:
+- x1 = left edge
+- y1 = top edge
+- x2 = right edge
+- y2 = bottom edge
+
+Coordinates are integer PIXELS in the image as presented to the vision
+model after its visual preprocessing. Do NOT use the original uploaded
+image dimensions. Do NOT use normalized 0-1 coordinates. Do NOT use the
+0-1000 coordinate convention.
+
+Return ONLY valid JSON for grounding results. Use this exact schema:
+[
+  {"bbox_2d": [x1, y1, x2, y2], "label": "object label"}
+]
+
+The bbox is [left, top, right, bottom] in pixels. Do not add markdown or
+prose before or after the JSON.
+""".strip()
+
+    system_instruction = f"""
+You are RSCoVLM, a remote-sensing vision-language assistant.
+
+{image_instruction}
+
+Analyze the supplied remote-sensing imagery carefully.
+
+Answer the user's question using information supported by the supplied imagery.
+
+When appropriate:
+- identify land-cover or scene characteristics
+- describe visible objects
+- describe spatial relationships
+- identify built-up areas, roads, water, vegetation, agricultural regions,
+  infrastructure, or other visible features
+- compare supplied images when relevant
+- distinguish observations from uncertain interpretations
+- do not invent geographic facts that cannot be supported by the supplied imagery
+
+{grounding_instruction}
+
+Give a concise, useful answer suitable for an analytical remote-sensing application.
+""".strip()
 
     labels_text = ""
 
     if image_labels:
         labels_text = (
-            "\n\nImages are supplied in this order:\n"
+            "\n\nImage ordering:\n"
             + "\n".join(
-                f"{i + 1}. {label}"
-                for i, label in enumerate(image_labels)
+                f"{index + 1}. {label}"
+                for index, label in enumerate(image_labels)
             )
         )
-
-    mask_text = ""
-
-    if has_mask:
-        mask_text = """
-
-CHANGE MASK INTERPRETATION:
-The supplied ChangeFormer mask is a binary prediction:
-- White pixels (255) indicate pixels predicted as changed.
-- Black pixels (0) indicate pixels predicted as unchanged.
-- Treat the mask as model output, not ground truth.
-- Compare the mask with the before and after images.
-- If the mask appears inconsistent with the images, say so.
-- Do not claim the mask identifies the type of change by itself.
-"""
 
     metadata_text = ""
 
     if metadata:
         metadata_text = (
-            "\n\nApplication image metadata:\n"
-            + str(metadata)
+            "\n\nImage metadata supplied by the application:\n"
+            f"{metadata}"
         )
 
     history_text = ""
 
     if conversation_history:
-        if not isinstance(conversation_history, list):
-            raise ValueError(
-                "'conversation_history' must be a list."
-            )
-
-        recent = conversation_history[-8:]
-        lines = []
+        recent = conversation_history[-6:]
+        history_lines = []
 
         for item in recent:
-            if not isinstance(item, dict):
-                continue
-
             role = item.get("role", "user")
             content = item.get("content", "")
 
-            if role not in ("user", "assistant"):
-                continue
-
             if content:
-                lines.append(f"{role}: {content}")
+                history_lines.append(
+                    f"{role}: {content}"
+                )
 
-        if lines:
+        if history_lines:
             history_text = (
-                "\n\nRecent conversation:\n"
-                + "\n".join(lines)
+                "\n\nRecent conversation context:\n"
+                + "\n".join(history_lines)
             )
 
     return (
-        "You are RSCoVLM, a remote-sensing vision-language assistant.\n\n"
-        + instruction
+        system_instruction
         + labels_text
-        + mask_text
         + metadata_text
         + history_text
-        + "\n\nCurrent user request:\n"
+        + "\n\nUser question:\n"
         + prompt
     )
 
 
 # ============================================================
-# PARSE PIXEL BOXES
+# Qwen input construction
 # ============================================================
 
-def parse_groundings(
-    response_text,
-    model_width,
-    model_height,
-    original_width,
-    original_height,
-):
-    """
-    Parse RSCoVLM grounding output in model-view pixel coordinates,
-    then convert it to normalized original-image coordinates.
-
-    Frontend contract:
-        bbox = [ymin, xmin, ymax, xmax], each in [0, 1]
-    """
-    groundings = []
-
-    if not response_text:
-        return groundings
-
-    if (
-        model_width <= 0
-        or model_height <= 0
-        or original_width <= 0
-        or original_height <= 0
-    ):
-        return groundings
-
-    pattern = re.compile(
-        r"""
-        ^\s*
-        \(?\s*
-        (-?\d+(?:\.\d+)?)\s*[,;]\s*
-        (-?\d+(?:\.\d+)?)\s*[,;]\s*
-        (-?\d+(?:\.\d+)?)\s*[,;]\s*
-        (-?\d+(?:\.\d+)?)
-        \s*\)?
-        (?:\s*[-:|]\s*|\s+)
-        (.*?)
-        \s*$
-        """,
-        re.VERBOSE,
-    )
-
-    scale_x = original_width / model_width
-    scale_y = original_height / model_height
-
-    for line in response_text.splitlines():
-        match = pattern.match(line.strip())
-
-        if not match:
-            continue
-
-        try:
-            x1, y1, x2, y2 = [
-                float(match.group(i))
-                for i in range(1, 5)
-            ]
-        except (TypeError, ValueError):
-            continue
-
-        if not all(
-            math.isfinite(v)
-            for v in (x1, y1, x2, y2)
-        ):
-            continue
-
-        if (
-            min(x1, y1, x2, y2) < 0
-            or x1 > model_width
-            or x2 > model_width
-            or y1 > model_height
-            or y2 > model_height
-        ):
-            continue
-
-        left, right = sorted((x1, x2))
-        top, bottom = sorted((y1, y2))
-
-        if right <= left or bottom <= top:
-            continue
-
-        original_left = left * scale_x
-        original_right = right * scale_x
-        original_top = top * scale_y
-        original_bottom = bottom * scale_y
-
-        groundings.append({
-            "bbox": [
-                max(
-                    0.0,
-                    min(1.0, original_top / original_height),
-                ),
-                max(
-                    0.0,
-                    min(1.0, original_left / original_width),
-                ),
-                max(
-                    0.0,
-                    min(1.0, original_bottom / original_height),
-                ),
-                max(
-                    0.0,
-                    min(1.0, original_right / original_width),
-                ),
-            ],
-            "label": (
-                match.group(5).strip()
-                or "Detected object"
-            ),
-            "coordinate_type": "normalized_original_image",
-            "coordinate_format": "ymin,xmin,ymax,xmax",
-            "source_bbox": [
-                left,
-                top,
-                right,
-                bottom,
-            ],
-            "source_coordinate_type": "model_view_pixels",
-            "source_image_size": [
-                model_width,
-                model_height,
-            ],
-            "original_image_size": [
-                original_width,
-                original_height,
-            ],
-        })
-
-    return groundings
-
-
-# ============================================================
-# MODEL INFERENCE
-# ============================================================
-
-@torch.inference_mode()
-def run_inference(images, prompt):
+def build_messages(images, prompt: str):
     content = []
 
     for image in images:
-        content.append({
-            "type": "image",
-            "image": image,
-        })
+        content.append(
+            {
+                "type": "image",
+                "image": image,
+            }
+        )
 
-    content.append({
-        "type": "text",
-        "text": prompt,
-    })
+    content.append(
+        {
+            "type": "text",
+            "text": prompt,
+        }
+    )
 
-    messages = [{
-        "role": "user",
-        "content": content,
-    }]
+    return [
+        {
+            "role": "user",
+            "content": content,
+        }
+    ]
 
+
+def prepare_inputs(messages):
     text = processor.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
     )
 
-    image_inputs, video_inputs = process_vision_info(
-        messages
-    )
+    image_inputs, video_inputs = process_vision_info(messages)
 
     inputs = processor(
         text=[text],
@@ -616,6 +481,240 @@ def run_inference(images, prompt):
         padding=True,
         return_tensors="pt",
     )
+
+    return inputs, text
+
+
+def get_model_view_size(inputs) -> Tuple[int, int]:
+    """
+    Return the actual spatial dimensions represented by Qwen's visual grid.
+
+    Qwen2.5-VL exposes image_grid_thw after preprocessing. The first image
+    has [temporal, height_grid, width_grid], and each spatial grid cell is
+    28 image pixels for the Qwen2.5-VL processor configuration used here.
+    """
+    grid = inputs.get("image_grid_thw")
+
+    if grid is None:
+        raise RuntimeError(
+            "Qwen processor did not return image_grid_thw; cannot safely "
+            "map RSCoVLM grounding coordinates to the original image."
+        )
+
+    if hasattr(grid, "detach"):
+        grid_values = grid.detach().cpu().tolist()
+    else:
+        grid_values = grid.tolist()
+
+    if not grid_values:
+        raise RuntimeError(
+            "Qwen processor returned an empty image_grid_thw."
+        )
+
+    first = grid_values[0]
+
+    if len(first) < 3:
+        raise RuntimeError(
+            f"Unexpected image_grid_thw value: {grid_values}"
+        )
+
+    height_grid = int(first[1])
+    width_grid = int(first[2])
+
+    model_height = height_grid * VISION_GRID_SIZE
+    model_width = width_grid * VISION_GRID_SIZE
+
+    if model_width <= 0 or model_height <= 0:
+        raise RuntimeError(
+            f"Invalid model-view dimensions: {model_width}x{model_height}"
+        )
+
+    return model_width, model_height
+
+
+# ============================================================
+# Grounding parser
+# ============================================================
+
+NUMBER = r"[-+]?\d+(?:\.\d+)?"
+
+# Deliberately require four numbers followed by a separator/label. This
+# avoids interpreting arbitrary four-number prose as a bounding box.
+BBOX_LINE_RE = re.compile(
+    rf"(?<!\d)\[?\s*({NUMBER})\s*[,;]\s*({NUMBER})\s*[,;]\s*"
+    rf"({NUMBER})\s*[,;]\s*({NUMBER})\s*\]?\s*(?:[-–—:]\s*)?(.+)?$",
+    re.IGNORECASE,
+)
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def parse_grounding_lines(response_text: str) -> List[Dict[str, Any]]:
+    """Extract Qwen JSON grounding boxes, with a plain-text fallback."""
+    candidates: List[Dict[str, Any]] = []
+    text = (response_text or "").strip()
+
+    # Preferred Qwen2.5-VL JSON format.
+    json_match = re.search(r"\[\s*\{.*\}\s*\]", text, re.DOTALL)
+
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group(0))
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+
+                    bbox = item.get("bbox_2d") or item.get("bbox")
+                    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                        continue
+
+                    try:
+                        values = [float(value) for value in bbox]
+                    except (TypeError, ValueError):
+                        continue
+
+                    label = str(
+                        item.get("label")
+                        or item.get("sub_label")
+                        or "Detected Object"
+                    ).strip()
+
+                    candidates.append({
+                        "values": values,
+                        "label": label or "Detected Object",
+                        "raw_line": json.dumps(item, ensure_ascii=False),
+                    })
+
+                if candidates:
+                    return candidates
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    # Plain-text fallback: x1,y1,x2,y2 - object label
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        clean = re.sub(
+            r"</?(?:box|ref|grounding)>",
+            " ",
+            line,
+            flags=re.IGNORECASE,
+        )
+
+        match = re.search(
+            rf"(?<!\d)\[?\s*({NUMBER})\s*[,;]\s*({NUMBER})\s*[,;]\s*"
+            rf"({NUMBER})\s*[,;]\s*({NUMBER})\s*\]?",
+            clean,
+            re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        values = [
+            float(match.group(index))
+            for index in range(1, 5)
+        ]
+
+        label = clean[match.end():].strip(" -*_:`\t")
+        if not label:
+            label = clean[:match.start()].strip(" -*_:`\t")
+        if not label:
+            label = "Detected Object"
+
+        candidates.append({
+            "values": values,
+            "label": label,
+            "raw_line": line,
+        })
+
+    return candidates
+
+
+def parse_groundings(
+    response_text: str,
+    model_width: int,
+    model_height: int,
+    original_width: int,
+    original_height: int,
+) -> List[Dict[str, Any]]:
+    groundings = []
+
+    for candidate in parse_grounding_lines(response_text):
+        try:
+            bbox, source_type = convert_grounding_to_original(
+                candidate["values"],
+                model_width=model_width,
+                model_height=model_height,
+                original_width=original_width,
+                original_height=original_height,
+            )
+        except ValueError as exc:
+            print(
+                "Skipping invalid grounding line:",
+                candidate["raw_line"],
+                "reason:",
+                exc,
+            )
+            continue
+
+        groundings.append(
+            {
+                "bbox": bbox,
+                "label": candidate["label"],
+                "confidence": None,
+                "coordinate_type": "normalized_original_image",
+                "coordinate_format": "ymin,xmin,ymax,xmax",
+                "source_bbox": candidate["values"],
+                "source_coordinate_type": source_type,
+                "source_image_size": {
+                    "width": model_width,
+                    "height": model_height,
+                },
+                "original_image_size": {
+                    "width": original_width,
+                    "height": original_height,
+                },
+                "raw_line": candidate["raw_line"],
+            }
+        )
+
+    return groundings
+
+
+# ============================================================
+# RSCoVLM inference
+# ============================================================
+
+@torch.inference_mode()
+def run_inference(
+    images,
+    prompt: str,
+    task_type: Optional[str] = None,
+):
+    grounding = is_grounding_task(task_type, prompt)
+
+    messages = build_messages(images, prompt)
+    inputs, _ = prepare_inputs(messages)
+
+    model_width, model_height = get_model_view_size(inputs)
+
+    print(
+        "Qwen visual model-view size: "
+        f"{model_width}x{model_height}"
+    )
+
+    # The first image is the image whose coordinate space is exposed to the
+    # frontend. For a normal single-image grounding request this is exactly
+    # the uploaded image. Multi-image grounding is not requested by the
+    # current agent, but the metadata makes the behavior explicit.
+    original_width = images[0].width
+    original_height = images[0].height
 
     inputs = inputs.to(model.device)
 
@@ -630,7 +729,7 @@ def run_inference(images, prompt):
         output_ids[len(input_ids):]
         for input_ids, output_ids in zip(
             inputs.input_ids,
-            generated_ids
+            generated_ids,
         )
     ]
 
@@ -640,15 +739,39 @@ def run_inference(images, prompt):
         clean_up_tokenization_spaces=False,
     )
 
-    return (
+    response_text = (
         output_text[0].strip()
         if output_text
         else ""
     )
 
+    groundings = []
+
+    if grounding and len(images) >= 1:
+        groundings = parse_groundings(
+            response_text=response_text,
+            model_width=model_width,
+            model_height=model_height,
+            original_width=original_width,
+            original_height=original_height,
+        )
+
+    return {
+        "response_text": response_text,
+        "groundings": groundings,
+        "model_view_size": {
+            "width": model_width,
+            "height": model_height,
+        },
+        "original_image_size": {
+            "width": original_width,
+            "height": original_height,
+        },
+    }
+
 
 # ============================================================
-# RUNPOD HANDLER
+# RunPod handler
 # ============================================================
 
 def handler(job):
@@ -657,99 +780,103 @@ def handler(job):
     try:
         prompt = job_input.get(
             "prompt",
-            "Analyze the supplied remote-sensing images."
+            "Analyze the supplied remote sensing imagery.",
         )
 
-        metadata = job_input.get("metadata", {})
+        task_type = job_input.get(
+            "task_type",
+            "vqa",
+        )
+
+        metadata = job_input.get(
+            "metadata",
+            {},
+        )
 
         conversation_history = job_input.get(
             "conversation_history",
-            []
+            [],
         )
-
-        task_type = detect_task_type(job_input)
 
         images, image_labels = collect_images(job_input)
+        image_count = len(images)
 
-        # Keep the original image for UI coordinates and create an
-        # explicit model-view image for grounding.
-        original_first_image = images[0]
-
-        has_mask = bool(job_input.get("mask_b64"))
-
-        model_images = prepare_model_images(
-            images,
+        grounding = is_grounding_task(
             task_type,
+            prompt,
         )
 
-        model_first_image = model_images[0]
+        print("=" * 70)
+        print(
+            f"RSCoVLM JOB RECEIVED | {image_count} IMAGE(S)"
+        )
+        print(f"Task type: {task_type}")
+        print(f"Grounding mode: {grounding}")
+        print(f"Prompt: {prompt}")
+
+        for index, image in enumerate(images):
+            print(
+                f"{image_labels[index]}: "
+                f"{image.width}x{image.height}"
+            )
+
+        print("=" * 70)
 
         final_prompt = build_prompt(
             prompt=prompt,
-            task_type=task_type,
-            image=model_first_image,
+            image_count=image_count,
             image_labels=image_labels,
             conversation_history=conversation_history,
             metadata=metadata,
-            has_mask=has_mask,
+            task_type=task_type,
         )
 
-        response_text = run_inference(
-            images=model_images,
+        inference = run_inference(
+            images=images,
             prompt=final_prompt,
+            task_type=task_type,
         )
+
+        response_text = inference["response_text"]
 
         if not response_text:
             response_text = (
-                "RSCoVLM completed inference but returned "
-                "an empty response."
+                "RSCoVLM completed inference "
+                "but returned an empty response."
             )
-
-        if task_type == "grounding":
-            groundings = parse_groundings(
-                response_text,
-                model_first_image.width,
-                model_first_image.height,
-                original_first_image.width,
-                original_first_image.height,
-            )
-        else:
-            groundings = []
-
-        print(
-            "RSCoVLM MODEL VIEW:",
-            {
-                "width": model_first_image.width,
-                "height": model_first_image.height,
-            },
-        )
-        print("RAW MODEL RESPONSE:", repr(response_text))
-        print("PARSED GROUNDINGS:", groundings)
 
         return {
             "response_text": response_text,
-            "groundings": groundings,
-            "task_type": task_type,
+            "groundings": inference["groundings"],
             "model_used": MODEL_ID,
             "metadata": {
-                "image_count": len(images),
+                "task_type": task_type,
+                "grounding_enabled": grounding,
+                "image_count": image_count,
                 "images": [
                     {
                         "label": image_labels[index],
                         "width": image.width,
                         "height": image.height,
-                        "model_view_width": model_images[index].width,
-                        "model_view_height": model_images[index].height,
                     }
                     for index, image in enumerate(images)
                 ],
-                "mask_included": has_mask,
+                "original_image_size": inference[
+                    "original_image_size"
+                ],
+                "model_view_size": inference[
+                    "model_view_size"
+                ],
                 "device": DEVICE,
             },
         }
 
     except Exception as exc:
+        print("=" * 70)
+        print("RSCoVLM INFERENCE ERROR")
+        print("=" * 70)
         traceback.print_exc()
+        print("=" * 70)
 
         return {
             "response_text": "",
@@ -761,12 +888,16 @@ def handler(job):
 
 
 # ============================================================
-# START WORKER
+# Start worker
 # ============================================================
 
 if __name__ == "__main__":
     load_model()
 
-    runpod.serverless.start({
-        "handler": handler
-    })
+    print("Starting RunPod serverless worker...")
+
+    runpod.serverless.start(
+        {
+            "handler": handler
+        }
+    )
