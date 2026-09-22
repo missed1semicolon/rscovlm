@@ -1,4 +1,3 @@
-
 import os
 import io
 import re
@@ -53,8 +52,8 @@ def load_model():
 
     print("=" * 60)
     print("SNZ RSCoVLM WORKER STARTING")
-    print(f"Model: {MODEL_ID}")
-    print(f"Device: {DEVICE}")
+    print("Model:", MODEL_ID)
+    print("Device:", DEVICE)
     print("=" * 60)
 
     if not torch.cuda.is_available():
@@ -81,7 +80,7 @@ def load_model():
 
 
 # ============================================================
-# IMAGE DECODING
+# BASE64 IMAGE DECODING
 # ============================================================
 
 def decode_base64_image(image_b64):
@@ -109,66 +108,71 @@ def collect_images(job_input):
     images = []
     labels = []
 
-    image_b64 = job_input.get("image_b64")
-
-    if image_b64:
-        images.append(
-            decode_base64_image(image_b64)
-        )
-        labels.append("Primary image")
-
-    images_b64 = job_input.get("images_b64")
-
-    if images_b64:
-        if not isinstance(images_b64, list):
-            raise ValueError(
-                "'images_b64' must be a list."
-            )
-
-        for index, image_data in enumerate(images_b64):
-            if image_data:
-                images.append(
-                    decode_base64_image(image_data)
-                )
-                labels.append(
-                    f"Image {index + 1}"
-                )
-
-    # Compatibility with the existing agent.py payload.
-    additional_images = job_input.get(
-        "additional_images_b64"
-    )
-
-    if additional_images:
-        if not isinstance(additional_images, list):
-            raise ValueError(
-                "'additional_images_b64' must be a list."
-            )
-
-        for index, image_data in enumerate(additional_images):
-            if image_data:
-                images.append(
-                    decode_base64_image(image_data)
-                )
-                labels.append(
-                    f"Additional image {index + 1}"
-                )
-
-    # Temporal pair fields are retained for compatibility.
+    # Prefer explicit temporal pair fields when present.
     image_t1 = job_input.get("image_t1_b64")
     image_t2 = job_input.get("image_t2_b64")
 
     if image_t1:
-        images.append(
-            decode_base64_image(image_t1)
-        )
-        labels.append("Time 1 image")
+        images.append(decode_base64_image(image_t1))
+        labels.append("Before image (Time 1)")
 
     if image_t2:
-        images.append(
-            decode_base64_image(image_t2)
+        images.append(decode_base64_image(image_t2))
+        labels.append("After image (Time 2)")
+
+    # ChangeFormer's mask is the third image.
+    mask_b64 = job_input.get("mask_b64")
+
+    if mask_b64:
+        mask = decode_base64_image(mask_b64).convert("RGB")
+        images.append(mask)
+        labels.append(
+            "ChangeFormer binary change mask "
+            "(white=detected change, black=unchanged)"
         )
-        labels.append("Time 2 image")
+
+    # Existing compatibility fields, used only when no
+    # explicit temporal pair was supplied.
+    if not image_t1 and not image_t2:
+        image_b64 = job_input.get("image_b64")
+
+        if image_b64:
+            images.append(decode_base64_image(image_b64))
+            labels.append("Primary image")
+
+        images_b64 = job_input.get("images_b64")
+
+        if images_b64:
+            if not isinstance(images_b64, list):
+                raise ValueError(
+                    "'images_b64' must be a list."
+                )
+
+            for index, image_data in enumerate(images_b64):
+                if image_data:
+                    images.append(
+                        decode_base64_image(image_data)
+                    )
+                    labels.append(f"Image {index + 1}")
+
+        additional_images = job_input.get(
+            "additional_images_b64"
+        )
+
+        if additional_images:
+            if not isinstance(additional_images, list):
+                raise ValueError(
+                    "'additional_images_b64' must be a list."
+                )
+
+            for index, image_data in enumerate(additional_images):
+                if image_data:
+                    images.append(
+                        decode_base64_image(image_data)
+                    )
+                    labels.append(
+                        f"Additional image {index + 1}"
+                    )
 
     if not images:
         raise ValueError(
@@ -236,7 +240,7 @@ def detect_task_type(job_input):
 
 
 # ============================================================
-# TASK-SPECIFIC INSTRUCTIONS
+# TASK INSTRUCTIONS
 # ============================================================
 
 def task_instruction(task_type, image):
@@ -248,13 +252,7 @@ TASK: IMAGE CAPTIONING
 
 Image dimensions: width={width}, height={height} pixels.
 
-Write a concise, informative caption describing the
-visible remote-sensing scene.
-
-Mention relevant visible features such as buildings,
-roads, vegetation, water, agricultural land, or infrastructure.
-
-Do not output bounding boxes.
+Write a concise caption describing visible remote-sensing features.
 Do not invent geographic locations or unsupported details.
 """.strip()
 
@@ -264,31 +262,22 @@ TASK: VISUAL GROUNDING
 
 Image dimensions: width={width}, height={height} pixels.
 
-Identify the object or feature requested by the user.
-
-When you can identify it, output its bounding box using
-this exact format:
-
+Identify the object requested by the user.
+If possible, output its box as:
 x1,y1,x2,y2 - object label
 
-Coordinates must be pixel coordinates in the supplied image:
-x1 = left, y1 = top, x2 = right, y2 = bottom.
-
-The valid coordinate range is:
+Coordinates are pixels in the original image:
 x: 0 to {width}
 y: 0 to {height}
 
-Use one object per line.
-Do not use geographic longitude or latitude.
 Do not invent a box if the object cannot be located.
-Briefly state if the requested object is not identifiable.
 """.strip()
 
     return """
 TASK: REMOTE-SENSING VISUAL QUESTION ANSWERING
 
-Answer the user's question using visible image evidence.
-Be concise and distinguish observations from uncertainty.
+Answer using visible image evidence.
+Distinguish observations from uncertainty.
 Do not invent geographic facts.
 """.strip()
 
@@ -301,15 +290,15 @@ def build_prompt(
     prompt,
     task_type,
     image,
-    image_count,
     image_labels=None,
     conversation_history=None,
     metadata=None,
+    has_mask=False,
 ):
     prompt = (prompt or "").strip()
 
     if not prompt:
-        prompt = "Analyze the supplied remote-sensing image."
+        prompt = "Analyze the supplied remote-sensing images."
 
     instruction = task_instruction(
         task_type,
@@ -320,12 +309,27 @@ def build_prompt(
 
     if image_labels:
         labels_text = (
-            "\n\nImage ordering:\n"
+            "\n\nImages are supplied in this order:\n"
             + "\n".join(
                 f"{i + 1}. {label}"
                 for i, label in enumerate(image_labels)
             )
         )
+
+    mask_text = ""
+
+    if has_mask:
+        mask_text = """
+
+CHANGE MASK INTERPRETATION:
+The supplied ChangeFormer mask is a binary prediction:
+- White pixels (255) indicate pixels predicted as changed.
+- Black pixels (0) indicate pixels predicted as unchanged.
+- Treat the mask as model output, not ground truth.
+- Compare the mask with the before and after images.
+- If the mask appears inconsistent with the images, say so.
+- Do not claim the mask identifies the type of change by itself.
+"""
 
     metadata_text = ""
 
@@ -338,17 +342,26 @@ def build_prompt(
     history_text = ""
 
     if conversation_history:
-        recent = conversation_history[-6:]
+        if not isinstance(conversation_history, list):
+            raise ValueError(
+                "'conversation_history' must be a list."
+            )
+
+        recent = conversation_history[-8:]
         lines = []
 
         for item in recent:
+            if not isinstance(item, dict):
+                continue
+
             role = item.get("role", "user")
             content = item.get("content", "")
 
+            if role not in ("user", "assistant"):
+                continue
+
             if content:
-                lines.append(
-                    f"{role}: {content}"
-                )
+                lines.append(f"{role}: {content}")
 
         if lines:
             history_text = (
@@ -360,9 +373,10 @@ def build_prompt(
         "You are RSCoVLM, a remote-sensing vision-language assistant.\n\n"
         + instruction
         + labels_text
+        + mask_text
         + metadata_text
         + history_text
-        + "\n\nUser request:\n"
+        + "\n\nCurrent user request:\n"
         + prompt
     )
 
@@ -376,19 +390,6 @@ def parse_groundings(
     image_width,
     image_height
 ):
-    """
-    Parses RSCoVLM outputs such as:
-
-        1245,430,1297,481 visible buildings
-        1245,430,1297,481 - visible buildings
-        (1245,430,1297,481) - visible buildings
-
-    Assumes raw coordinates are x1,y1,x2,y2 pixels.
-
-    Returns normalized boxes in frontend order:
-        [ymin, xmin, ymax, xmax]
-    """
-
     groundings = []
 
     if not response_text:
@@ -397,8 +398,6 @@ def parse_groundings(
     if image_width <= 0 or image_height <= 0:
         return groundings
 
-    # Match the first four comma/semicolon-separated values.
-    # The label may follow directly or after punctuation.
     pattern = re.compile(
         r"""
         ^\s*
@@ -416,12 +415,7 @@ def parse_groundings(
     )
 
     for line in response_text.splitlines():
-        line = line.strip()
-
-        if not line:
-            continue
-
-        match = pattern.match(line)
+        match = pattern.match(line.strip())
 
         if not match:
             continue
@@ -435,19 +429,13 @@ def parse_groundings(
             continue
 
         if not all(
-            math.isfinite(value)
-            for value in (x1, y1, x2, y2)
+            math.isfinite(v)
+            for v in (x1, y1, x2, y2)
         ):
             continue
 
-        label = (
-            match.group(5) or "Detected object"
-        ).strip()
-
-        # Reject impossible or out-of-image coordinates.
         if (
-            x1 < 0 or y1 < 0
-            or x2 < 0 or y2 < 0
+            min(x1, y1, x2, y2) < 0
             or x1 > image_width
             or x2 > image_width
             or y1 > image_height
@@ -455,26 +443,23 @@ def parse_groundings(
         ):
             continue
 
-        left = min(x1, x2)
-        right = max(x1, x2)
-        top = min(y1, y2)
-        bottom = max(y1, y2)
+        left, right = sorted((x1, x2))
+        top, bottom = sorted((y1, y2))
 
         if right <= left or bottom <= top:
             continue
 
-        # Normalize for ImageBinder:
-        # [ymin, xmin, ymax, xmax]
-        bbox = [
-            top / image_height,
-            left / image_width,
-            bottom / image_height,
-            right / image_width,
-        ]
-
         groundings.append({
-            "bbox": bbox,
-            "label": label or "Detected object",
+            "bbox": [
+                top / image_height,
+                left / image_width,
+                bottom / image_height,
+                right / image_width,
+            ],
+            "label": (
+                match.group(5).strip()
+                or "Detected object"
+            ),
             "coordinate_type": "normalized_image_pixels",
         })
 
@@ -563,7 +548,7 @@ def handler(job):
     try:
         prompt = job_input.get(
             "prompt",
-            "Analyze the supplied remote-sensing image."
+            "Analyze the supplied remote-sensing images."
         )
 
         metadata = job_input.get("metadata", {})
@@ -575,20 +560,22 @@ def handler(job):
 
         task_type = detect_task_type(job_input)
 
-        images, image_labels = collect_images(
-            job_input
-        )
+        images, image_labels = collect_images(job_input)
 
+        # First image is the before image when temporal pair
+        # fields are supplied.
         first_image = images[0]
+
+        has_mask = bool(job_input.get("mask_b64"))
 
         final_prompt = build_prompt(
             prompt=prompt,
             task_type=task_type,
             image=first_image,
-            image_count=len(images),
             image_labels=image_labels,
             conversation_history=conversation_history,
             metadata=metadata,
+            has_mask=has_mask,
         )
 
         response_text = run_inference(
@@ -602,33 +589,14 @@ def handler(job):
                 "an empty response."
             )
 
-        # Always parse coordinate-form output, even if the
-        # task was classified as VQA or caption.
         groundings = parse_groundings(
             response_text,
             first_image.width,
             first_image.height,
         )
 
-        # Diagnostic logs for RunPod.
-        print(
-            "RAW MODEL RESPONSE:",
-            repr(response_text)
-        )
-
-        print(
-            "PARSED GROUNDINGS:",
-            groundings
-        )
-
-        print(
-            "SNZ inference complete:",
-            {
-                "task_type": task_type,
-                "groundings_count": len(groundings),
-                "image_count": len(images),
-            }
-        )
+        print("RAW MODEL RESPONSE:", repr(response_text))
+        print("PARSED GROUNDINGS:", groundings)
 
         return {
             "response_text": response_text,
@@ -645,6 +613,7 @@ def handler(job):
                     }
                     for index, image in enumerate(images)
                 ],
+                "mask_included": has_mask,
                 "device": DEVICE,
             },
         }
