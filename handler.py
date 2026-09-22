@@ -101,6 +101,59 @@ def decode_base64_image(image_b64):
 
 
 # ============================================================
+# MODEL-VIEW RESIZING
+# ============================================================
+
+# RSCoVLM uses scalable bounding boxes whose coordinate resolution
+# follows the image resolution presented to the model. Keep the
+# grounding coordinate system explicit by giving the model a bounded
+# model-view image and then mapping its box back to the original image.
+GROUNDING_MAX_SIDE = int(os.getenv("GROUNDING_MAX_SIDE", "1008"))
+MIN_GROUNDING_SIDE = int(os.getenv("MIN_GROUNDING_SIDE", "224"))
+
+
+def resize_for_grounding(image):
+    original_width, original_height = image.size
+
+    if original_width <= 0 or original_height <= 0:
+        raise ValueError("Image has invalid dimensions.")
+
+    longest_side = max(original_width, original_height)
+
+    scale = min(
+        1.0,
+        GROUNDING_MAX_SIDE / longest_side,
+    )
+
+    if longest_side < MIN_GROUNDING_SIDE:
+        scale = min(
+            GROUNDING_MAX_SIDE / longest_side,
+            MIN_GROUNDING_SIDE / longest_side,
+        )
+
+    model_width = max(1, round(original_width * scale))
+    model_height = max(1, round(original_height * scale))
+
+    if (model_width, model_height) == image.size:
+        return image.copy()
+
+    return image.resize(
+        (model_width, model_height),
+        Image.Resampling.LANCZOS,
+    )
+
+
+def prepare_model_images(images, task_type):
+    if task_type != "grounding":
+        return images
+
+    return [
+        resize_for_grounding(image)
+        for image in images
+    ]
+
+
+# ============================================================
 # COLLECT IMAGES
 # ============================================================
 
@@ -260,17 +313,23 @@ Do not invent geographic locations or unsupported details.
         return f"""
 TASK: VISUAL GROUNDING
 
-Image dimensions: width={width}, height={height} pixels.
+The image presented to you is exactly {width} pixels wide by {height} pixels high.
 
 Identify the object requested by the user.
-If possible, output its box as:
+
+Return exactly one line when the object is found:
 x1,y1,x2,y2 - object label
 
-Coordinates are pixels in the original image:
-x: 0 to {width}
-y: 0 to {height}
-
-Do not invent a box if the object cannot be located.
+Coordinate convention:
+- x increases left to right.
+- y increases top to bottom.
+- (x1,y1) is the top-left corner.
+- (x2,y2) is the bottom-right corner.
+- Coordinates are PIXELS IN THE IMAGE YOU ARE CURRENTLY SEEING.
+- x must be between 0 and {width}; y must be between 0 and {height}.
+- Do not use coordinates from the original upload if the image has been resized.
+- Do not use normalized 0-1 or 0-1000 coordinates.
+- Do not invent a box if the object cannot be located.
 """.strip()
 
     return """
@@ -387,15 +446,29 @@ The supplied ChangeFormer mask is a binary prediction:
 
 def parse_groundings(
     response_text,
-    image_width,
-    image_height
+    model_width,
+    model_height,
+    original_width,
+    original_height,
 ):
+    """
+    Parse RSCoVLM grounding output in model-view pixel coordinates,
+    then convert it to normalized original-image coordinates.
+
+    Frontend contract:
+        bbox = [ymin, xmin, ymax, xmax], each in [0, 1]
+    """
     groundings = []
 
     if not response_text:
         return groundings
 
-    if image_width <= 0 or image_height <= 0:
+    if (
+        model_width <= 0
+        or model_height <= 0
+        or original_width <= 0
+        or original_height <= 0
+    ):
         return groundings
 
     pattern = re.compile(
@@ -411,8 +484,11 @@ def parse_groundings(
         (.*?)
         \s*$
         """,
-        re.VERBOSE
+        re.VERBOSE,
     )
+
+    scale_x = original_width / model_width
+    scale_y = original_height / model_height
 
     for line in response_text.splitlines():
         match = pattern.match(line.strip())
@@ -436,10 +512,10 @@ def parse_groundings(
 
         if (
             min(x1, y1, x2, y2) < 0
-            or x1 > image_width
-            or x2 > image_width
-            or y1 > image_height
-            or y2 > image_height
+            or x1 > model_width
+            or x2 > model_width
+            or y1 > model_height
+            or y2 > model_height
         ):
             continue
 
@@ -449,18 +525,51 @@ def parse_groundings(
         if right <= left or bottom <= top:
             continue
 
+        original_left = left * scale_x
+        original_right = right * scale_x
+        original_top = top * scale_y
+        original_bottom = bottom * scale_y
+
         groundings.append({
             "bbox": [
-                top / image_height,
-                left / image_width,
-                bottom / image_height,
-                right / image_width,
+                max(
+                    0.0,
+                    min(1.0, original_top / original_height),
+                ),
+                max(
+                    0.0,
+                    min(1.0, original_left / original_width),
+                ),
+                max(
+                    0.0,
+                    min(1.0, original_bottom / original_height),
+                ),
+                max(
+                    0.0,
+                    min(1.0, original_right / original_width),
+                ),
             ],
             "label": (
                 match.group(5).strip()
                 or "Detected object"
             ),
-            "coordinate_type": "normalized_image_pixels",
+            "coordinate_type": "normalized_original_image",
+            "coordinate_format": "ymin,xmin,ymax,xmax",
+            "source_bbox": [
+                left,
+                top,
+                right,
+                bottom,
+            ],
+            "source_coordinate_type": "model_view_pixels",
+            "source_image_size": [
+                model_width,
+                model_height,
+            ],
+            "original_image_size": [
+                original_width,
+                original_height,
+            ],
         })
 
     return groundings
@@ -562,16 +671,23 @@ def handler(job):
 
         images, image_labels = collect_images(job_input)
 
-        # First image is the before image when temporal pair
-        # fields are supplied.
-        first_image = images[0]
+        # Keep the original image for UI coordinates and create an
+        # explicit model-view image for grounding.
+        original_first_image = images[0]
 
         has_mask = bool(job_input.get("mask_b64"))
+
+        model_images = prepare_model_images(
+            images,
+            task_type,
+        )
+
+        model_first_image = model_images[0]
 
         final_prompt = build_prompt(
             prompt=prompt,
             task_type=task_type,
-            image=first_image,
+            image=model_first_image,
             image_labels=image_labels,
             conversation_history=conversation_history,
             metadata=metadata,
@@ -579,7 +695,7 @@ def handler(job):
         )
 
         response_text = run_inference(
-            images=images,
+            images=model_images,
             prompt=final_prompt,
         )
 
@@ -589,12 +705,24 @@ def handler(job):
                 "an empty response."
             )
 
-        groundings = parse_groundings(
-            response_text,
-            first_image.width,
-            first_image.height,
-        )
+        if task_type == "grounding":
+            groundings = parse_groundings(
+                response_text,
+                model_first_image.width,
+                model_first_image.height,
+                original_first_image.width,
+                original_first_image.height,
+            )
+        else:
+            groundings = []
 
+        print(
+            "RSCoVLM MODEL VIEW:",
+            {
+                "width": model_first_image.width,
+                "height": model_first_image.height,
+            },
+        )
         print("RAW MODEL RESPONSE:", repr(response_text))
         print("PARSED GROUNDINGS:", groundings)
 
@@ -610,6 +738,8 @@ def handler(job):
                         "label": image_labels[index],
                         "width": image.width,
                         "height": image.height,
+                        "model_view_width": model_images[index].width,
+                        "model_view_height": model_images[index].height,
                     }
                     for index, image in enumerate(images)
                 ],
