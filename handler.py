@@ -496,51 +496,36 @@ When comparing images, explicitly distinguish:
 
     if grounding:
         grounding_instruction = """
-GROUNDING MODE
+GROUNDING EXTRACTION MODE
 
-The user is asking you to locate one or more objects or regions.
+The application needs machine-readable regions for the object or region
+requested by the user. Inspect the image carefully and identify the relevant
+region(s).
 
-You must do BOTH of the following:
+For this pass, output ONLY a JSON array. Do not output prose, explanations,
+headings, markdown fences, or the user's question.
 
-1. Give a concise natural-language answer to the user's question.
-2. On a separate line, output the machine-readable grounding JSON.
-
-Use this exact coordinate order:
-
-    x1, y1, x2, y2
-
-where:
-- x1 = left edge
-- y1 = top edge
-- x2 = right edge
-- y2 = bottom edge
-
-Coordinates are ABSOLUTE INTEGER PIXELS in the image as presented to the
-vision model after visual preprocessing.
-
-Do NOT use:
-- normalized 0-1 coordinates
-- the 0-1000 coordinate convention
-- percentages
-- original-upload dimensions when the vision processor resized the image
-
-Your response must follow this structure:
-
-A concise natural-language answer.
-
-GROUNDING_JSON:
+Each item must have exactly this shape:
 [
   {"bbox_2d": [x1, y1, x2, y2], "label": "object label"}
 ]
 
-If the requested object is not visibly identifiable, use:
+Coordinate contract:
+- x1 = left edge
+- y1 = top edge
+- x2 = right edge
+- y2 = bottom edge
+- coordinates are absolute integer pixels in the image as presented to the
+  vision model after visual preprocessing
+- do NOT use normalized 0-1 coordinates, 0-1000 coordinates, percentages,
+  or original-upload dimensions when the vision processor resized the image
+- keep x1 <= x2 and y1 <= y2
 
-GROUNDING_JSON:
+If the requested object or region is not visibly identifiable, output exactly:
 []
 
-Keep x1 <= x2 and y1 <= y2.
-
-Do not put any other coordinate formats in the natural-language answer.
+Do not output the words "GROUNDING_JSON" or any natural-language answer in
+this extraction pass.
 """.strip()
 
     system_instruction = f"""
@@ -567,7 +552,11 @@ When appropriate:
 
 {grounding_instruction}
 
-Give a concise, useful answer suitable for an analytical remote-sensing application.
+{
+    "For this pass, follow the grounding extraction contract above and do not generate a user-facing answer."
+    if grounding
+    else "Give a concise, useful answer suitable for an analytical remote-sensing application."
+}
 """.strip()
 
     labels_text = ""
@@ -1160,10 +1149,9 @@ def extract_display_response(
 
             break
 
-    return (
-        "I located the requested object in the image. "
-        "The bounding box is shown on the image."
-    )
+    # Never manufacture a natural-language answer from structured grounding
+    # output. A grounding answer must come from a real model inference pass.
+    return ""
 
 
 # ============================================================
@@ -1443,27 +1431,12 @@ def parse_groundings(
 # ============================================================
 
 @torch.inference_mode()
-def run_inference(
+def _generate_model_text(
     images: List[Image.Image],
     prompt: str,
-    task_type: Optional[str] = None,
-) -> Dict[str, Any]:
-    if model is None or processor is None:
-        raise RuntimeError(
-            "RSCoVLM worker is not initialized. "
-            "load_model() must run before inference."
-        )
-
-    if not images:
-        raise ValueError(
-            "run_inference received no images."
-        )
-
-    grounding = is_grounding_task(
-        task_type,
-        prompt,
-    )
-
+    collect_confidence: bool = False,
+) -> Tuple[str, Optional[float], List[Tuple[int, int]]]:
+    """Run one genuine RSCoVLM generation pass."""
     messages = build_messages(
         images,
         prompt,
@@ -1473,38 +1446,11 @@ def run_inference(
         messages
     )
 
-    # Only grounding needs model-view geometry. This prevents normal VQA
-    # from unnecessarily depending on image_grid_thw.
-    model_view_sizes: List[Tuple[int, int]] = []
+    model_view_sizes = get_model_view_sizes(
+        inputs,
+        image_count=len(images),
+    )
 
-    if grounding:
-        model_view_sizes = get_model_view_sizes(
-            inputs,
-            image_count=len(images),
-        )
-
-        first_width, first_height = (
-            model_view_sizes[0]
-        )
-
-        print(
-            "Qwen visual model-view size "
-            f"for grounding target: "
-            f"{first_width}x{first_height}"
-        )
-
-        if len(model_view_sizes) > 1:
-            print(
-                "Additional Qwen visual image sizes: "
-                f"{model_view_sizes[1:]}"
-            )
-
-    original_width = images[0].width
-    original_height = images[0].height
-
-    # Grounding coordinates are always tied to the FIRST supplied image.
-    # This is the primary image in SNZ and remains true even when an
-    # additional mask or comparison image is supplied.
     inputs = inputs.to(
         model.device
     )
@@ -1514,11 +1460,14 @@ def run_inference(
         max_new_tokens=MAX_NEW_TOKENS,
         do_sample=False,
         use_cache=True,
-        output_scores=True,
-        return_dict_in_generate=True,
+        output_scores=collect_confidence,
+        return_dict_in_generate=collect_confidence,
     )
 
-    generated_ids = generation.sequences
+    if collect_confidence:
+        generated_ids = generation.sequences
+    else:
+        generated_ids = generation
 
     generated_ids_trimmed = [
         output_ids[len(input_ids):]
@@ -1540,132 +1489,336 @@ def run_inference(
         else ""
     )
 
-    # Model-derived likelihood signal. This is NOT a calibrated
-    # probability of factual correctness.
     confidence: Optional[float] = None
 
-    try:
-        transition_scores = model.compute_transition_scores(
-            generation.sequences,
-            generation.scores,
-            normalize_logits=True,
-        )
-
-        token_ids = generated_ids_trimmed[0]
-        token_scores = transition_scores[0]
-
-        eos_token_id = getattr(
-            processor.tokenizer,
-            "eos_token_id",
-            None,
-        )
-
-        pad_token_id = getattr(
-            processor.tokenizer,
-            "pad_token_id",
-            None,
-        )
-
-        valid_scores = []
-
-        for token_id, token_score in zip(
-            token_ids,
-            token_scores,
-        ):
-            token_id_int = int(
-                token_id.item()
+    if collect_confidence:
+        try:
+            transition_scores = model.compute_transition_scores(
+                generation.sequences,
+                generation.scores,
+                normalize_logits=True,
             )
 
-            if (
-                eos_token_id is not None
-                and token_id_int == eos_token_id
-            ):
-                break
+            token_ids = generated_ids_trimmed[0]
+            token_scores = transition_scores[0]
 
-            if (
-                pad_token_id is not None
-                and token_id_int == pad_token_id
-            ):
-                continue
-
-            if torch.isfinite(token_score):
-                valid_scores.append(token_score)
-
-        if valid_scores:
-            mean_log_probability = torch.stack(
-                valid_scores
-            ).mean()
-
-            confidence = float(
-                torch.exp(
-                    mean_log_probability
-                ).clamp(
-                    min=0.0,
-                    max=1.0,
-                ).item()
+            eos_token_id = getattr(
+                processor.tokenizer,
+                "eos_token_id",
+                None,
             )
 
-    except Exception as exc:
-        print(
-            "Optional model-confidence calculation failed:",
-            exc,
-        )
-        confidence = None
+            pad_token_id = getattr(
+                processor.tokenizer,
+                "pad_token_id",
+                None,
+            )
 
-    groundings: List[Dict[str, Any]] = []
+            valid_scores = []
 
-    if grounding:
-        model_width, model_height = (
-            model_view_sizes[0]
-        )
+            for token_id, token_score in zip(
+                token_ids,
+                token_scores,
+            ):
+                token_id_int = int(
+                    token_id.item()
+                )
 
-        groundings = parse_groundings(
-            response_text=raw_response_text,
-            model_width=model_width,
-            model_height=model_height,
-            original_width=original_width,
-            original_height=original_height,
-        )
+                if (
+                    eos_token_id is not None
+                    and token_id_int == eos_token_id
+                ):
+                    break
 
-    response_text = extract_display_response(
+                if (
+                    pad_token_id is not None
+                    and token_id_int == pad_token_id
+                ):
+                    continue
+
+                if torch.isfinite(token_score):
+                    valid_scores.append(token_score)
+
+            if valid_scores:
+                mean_log_probability = torch.stack(
+                    valid_scores
+                ).mean()
+
+                confidence = float(
+                    torch.exp(
+                        mean_log_probability
+                    ).clamp(
+                        min=0.0,
+                        max=1.0,
+                    ).item()
+                )
+
+        except Exception as exc:
+            print(
+                "Optional model-confidence calculation failed:",
+                exc,
+            )
+
+    return (
         raw_response_text,
-        grounding=grounding,
+        confidence,
+        model_view_sizes,
     )
 
-    result: Dict[str, Any] = {
-        "response_text": response_text,
-        "raw_response_text": raw_response_text,
+
+def _build_grounding_answer_prompt(
+    user_prompt: str,
+    grounding_items: List[Dict[str, Any]],
+) -> str:
+    """Build the second, prose-only inference prompt for grounding."""
+    grounding_evidence = json.dumps(
+        [
+            {
+                "label": item.get("label", "object"),
+                "bbox_2d": item.get("source_bbox", []),
+            }
+            for item in grounding_items
+        ],
+        ensure_ascii=False,
+    )
+
+    return f"""
+You are RSCoVLM answering the user's remote-sensing question.
+
+This is the FINAL ANSWER pass. Inspect the supplied image yourself and answer
+based on the visible evidence. The preliminary grounding extraction below is
+evidence to help you focus on the requested region; it is not a substitute for
+visual reasoning and it is not guaranteed to be correct.
+
+Application task and original user question:
+{user_prompt}
+
+Preliminary grounding evidence:
+{grounding_evidence}
+
+Write the actual natural-language answer to the user's question.
+
+STRICT OUTPUT RULES:
+- Output only the answer that should be shown to the user.
+- Do not output JSON.
+- Do not output bounding boxes or coordinates.
+- Do not output the words GROUNDING_JSON, ANSWER:, RESPONSE:, or similar labels.
+- Do not repeat or paraphrase these instructions.
+- Never output the phrase "A concise natural-language answer."
+- Do not invent details that are not supported by the image.
+- If the evidence is uncertain, state the uncertainty naturally.
+- Keep the answer concise but complete.
+""".strip()
+
+
+def _is_invalid_generated_answer(text: str) -> bool:
+    """Reject structural/model-instruction text without inventing an answer."""
+    value = (text or "").strip()
+    if not value:
+        return True
+
+    lowered = value.lower().strip()
+
+    if lowered in {
+        "a concise natural-language answer.",
+        "a concise natural-language answer",
+        "a concise answer.",
+        "a concise answer",
+    }:
+        return True
+
+    if "grounding_json:" in lowered:
+        return True
+
+    if lowered.startswith("[") or lowered.startswith("{"):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, (dict, list)):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+@torch.inference_mode()
+def run_inference(
+    images: List[Image.Image],
+    prompt: str,
+    task_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    if model is None or processor is None:
+        raise RuntimeError(
+            "RSCoVLM worker is not initialized. "
+            "load_model() must run before inference."
+        )
+
+    if not images:
+        raise ValueError(
+            "run_inference received no images."
+        )
+
+    grounding = is_grounding_task(
+        task_type,
+        prompt,
+    )
+
+    original_width = images[0].width
+    original_height = images[0].height
+
+    # --------------------------------------------------------
+    # Normal VQA/captioning: one ordinary natural-language pass.
+    # --------------------------------------------------------
+    if not grounding:
+        raw_response_text, confidence, model_view_sizes = (
+            _generate_model_text(
+                images=images,
+                prompt=prompt,
+                collect_confidence=True,
+            )
+        )
+
+        return {
+            "response_text": raw_response_text.strip(),
+            "raw_response_text": raw_response_text,
+            "groundings": [],
+            "confidence": confidence,
+            "confidence_method": (
+                "geometric_mean_generated_token_probability"
+                if confidence is not None
+                else "unavailable"
+            ),
+            "original_image_size": {
+                "width": original_width,
+                "height": original_height,
+            },
+            "model_view_size": (
+                {
+                    "width": model_view_sizes[0][0],
+                    "height": model_view_sizes[0][1],
+                }
+                if model_view_sizes
+                else None
+            ),
+            "model_view_sizes": [
+                {
+                    "width": width,
+                    "height": height,
+                }
+                for width, height in model_view_sizes
+            ],
+        }
+
+    # --------------------------------------------------------
+    # Grounding uses TWO genuine model inference passes:
+    #   1. region extraction -> JSON only
+    #   2. answer generation -> natural language only
+    # This prevents the structured grounding contract from competing with
+    # the user-facing prose contract in a single generation.
+    # --------------------------------------------------------
+    grounding_prompt = prompt
+
+    raw_grounding_text, _, model_view_sizes = (
+        _generate_model_text(
+            images=images,
+            prompt=grounding_prompt,
+            collect_confidence=False,
+        )
+    )
+
+    if not model_view_sizes:
+        raise RuntimeError(
+            "RSCoVLM did not return a model-view image size for grounding."
+        )
+
+    model_width, model_height = model_view_sizes[0]
+
+    print(
+        "Qwen visual model-view size "
+        f"for grounding target: {model_width}x{model_height}"
+    )
+
+    if len(model_view_sizes) > 1:
+        print(
+            "Additional Qwen visual image sizes: "
+            f"{model_view_sizes[1:]}"
+        )
+
+    groundings = parse_groundings(
+        response_text=raw_grounding_text,
+        model_width=model_width,
+        model_height=model_height,
+        original_width=original_width,
+        original_height=original_height,
+    )
+
+    answer_prompt = _build_grounding_answer_prompt(
+        user_prompt=prompt,
+        grounding_items=groundings,
+    )
+
+    answer_text = ""
+    answer_confidence: Optional[float] = None
+    answer_raw_text = ""
+
+    # Two answer attempts are still genuine RSCoVLM inference. The second
+    # attempt is only used when the first generation violates the output
+    # contract; no canned answer is ever substituted.
+    for attempt in range(2):
+        attempt_prompt = answer_prompt
+
+        if attempt == 1:
+            attempt_prompt = answer_prompt + "\n\nReturn only the actual answer text now."
+
+        (
+            candidate_text,
+            candidate_confidence,
+            _,
+        ) = _generate_model_text(
+            images=images,
+            prompt=attempt_prompt,
+            collect_confidence=True,
+        )
+
+        answer_raw_text = candidate_text
+        answer_confidence = candidate_confidence
+
+        if not _is_invalid_generated_answer(candidate_text):
+            answer_text = candidate_text.strip()
+            break
+
+        print(
+            "RSCoVLM grounding answer pass produced invalid structural "
+            f"output on attempt {attempt + 1}; retrying with a stricter prompt."
+        )
+
+    return {
+        "response_text": answer_text,
+        "raw_response_text": answer_raw_text,
+        "grounding_raw_response": raw_grounding_text,
         "groundings": groundings,
-        "confidence": confidence,
+        "confidence": answer_confidence,
         "confidence_method": (
             "geometric_mean_generated_token_probability"
-            if confidence is not None
+            if answer_confidence is not None
             else "unavailable"
         ),
         "original_image_size": {
             "width": original_width,
             "height": original_height,
         },
-    }
-
-    if grounding:
-        result["model_view_size"] = {
-            "width": model_view_sizes[0][0],
-            "height": model_view_sizes[0][1],
-        }
-
-        result["model_view_sizes"] = [
+        "model_view_size": {
+            "width": model_width,
+            "height": model_height,
+        },
+        "model_view_sizes": [
             {
                 "width": width,
                 "height": height,
             }
             for width, height in model_view_sizes
-        ]
-    else:
-        result["model_view_size"] = None
-        result["model_view_sizes"] = []
-
-    return result
+        ],
+    }
 
 
 # ============================================================
@@ -1790,11 +1943,8 @@ def handler(
             "",
         )
 
-        if not response_text:
-            response_text = (
-                "RSCoVLM completed inference "
-                "but returned an empty response."
-            )
+        # Never replace a failed/empty model answer with canned prose.
+        # The response_text field must contain genuine RSCoVLM inference.
 
         result_metadata: Dict[str, Any] = {
             "task_type": task_type,
