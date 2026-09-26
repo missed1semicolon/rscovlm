@@ -499,8 +499,19 @@ When comparing images, explicitly distinguish:
 GROUNDING EXTRACTION MODE
 
 The application needs machine-readable regions for the object or region
-requested by the user. Inspect the image carefully and identify the relevant
-region(s).
+requested by the user. Inspect the full image carefully and identify ALL
+visible instances that match the requested object or region.
+
+MULTI-INSTANCE REQUIREMENTS:
+- For requests using words such as "all", "every", or a plural object name,
+  return a separate bounding box for each distinct visible instance/cluster.
+- Do not return only the most prominent, highest-confidence, or nearest instance.
+- Do not combine spatially separate instances into one large box.
+- If multiple distinct instances are visible, include every instance that can
+  be localized reliably. Do not invent instances or duplicate the same region.
+- When previous grounding evidence is included in the conversation context,
+  use it as a location cue, then verify each candidate against the current image.
+  Include all matching visible regions, not only the previously highlighted one.
 
 For this pass, output ONLY a JSON array. Do not output prose, explanations,
 headings, markdown fences, or the user's question.
@@ -604,6 +615,35 @@ When appropriate:
                 history_lines.append(
                     f"{role}: {content}"
                 )
+
+            # Include saved spatial evidence with the corresponding assistant
+            # turn so follow-up grounding can resolve references such as
+            # "the wildfires you mentioned" without relying on prose alone.
+            prior_groundings = item.get("groundings")
+            if role == "assistant" and isinstance(prior_groundings, list) and prior_groundings:
+                compact_groundings = []
+                for grounding_item in prior_groundings[:100]:
+                    if not isinstance(grounding_item, dict):
+                        continue
+                    bbox = grounding_item.get("bbox")
+                    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                        continue
+                    compact_groundings.append({
+                        "label": str(grounding_item.get("label") or "Detected Object"),
+                        "bbox": [float(value) for value in bbox],
+                        "coordinate_type": grounding_item.get(
+                            "coordinate_type", "normalized_original_image"
+                        ),
+                        "coordinate_format": grounding_item.get(
+                            "coordinate_format", "ymin,xmin,ymax,xmax"
+                        ),
+                    })
+                if compact_groundings:
+                    history_lines.append(
+                        "previous assistant grounding evidence (JSON; normalized original-image "
+                        "coordinates in ymin,xmin,ymax,xmax order): "
+                        + json.dumps(compact_groundings, ensure_ascii=False)
+                    )
 
         if history_lines:
             history_text = (
